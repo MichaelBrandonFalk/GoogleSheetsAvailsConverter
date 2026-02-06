@@ -1,0 +1,408 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Avails Converter")
+    .addItem("Convert to Amazon", "convertToAmazon")
+    .addItem("Convert to YouTube", "convertToYouTube")
+    .addToUi();
+}
+
+function convertToAmazon() {
+  convert_("AMAZON");
+}
+
+function convertToYouTube() {
+  convert_("YOUTUBE");
+}
+
+function convert_(target) {
+  const ss = SpreadsheetApp.getActive();
+  const inputSh = ss.getSheetByName("INPUT");
+  const outputSh = ss.getSheetByName("OUTPUT");
+  if (!inputSh || !outputSh) throw new Error("Missing INPUT or OUTPUT sheet.");
+
+  const input = readBlock_(inputSh);
+  if (!input.values.length) throw new Error("INPUT is empty.");
+
+  const source = detectSource_(input);
+  const workType = detectWorkType_(input, source);
+
+  const tmpl = getTemplate_(ss, target, workType);
+  const out = buildConvertedOutput_(input, source, target, tmpl, workType);
+
+  outputSh.clearContents();
+  outputSh.getRange(1, 1, out.length, out[0].length).setValues(out);
+
+  applyFormats_(outputSh, target, tmpl.fieldIndex);
+}
+
+/* -----------------------------
+   Reading and detection
+--------------------------------*/
+function readBlock_(sh) {
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return { values: [] };
+  const values = sh.getRange(1, 1, lastRow, lastCol).getValues();
+  return { values };
+}
+
+function detectSource_(input) {
+  const r2 = input.values[1] || [];
+  const hasALID = r2.indexOf("ALID") >= 0;
+  const hasPackage = r2.indexOf("PackageAssetId") >= 0;
+
+  const r3 = input.values[2] || [];
+  const likelyAmazon = (input.values[0].length >= 50) && isRowBlank_(r3);
+
+  if (likelyAmazon) return "AMAZON";
+  if (hasALID && (hasPackage || input.values[0].length <= 20)) return "YOUTUBE";
+
+  return (input.values[0].length >= 50) ? "AMAZON" : "YOUTUBE";
+}
+
+function detectWorkType_(input, source) {
+  const fieldRow = input.values[1] || [];
+  const workTypeCol = fieldRow.indexOf("WorkType");
+  if (workTypeCol < 0) throw new Error("Could not find WorkType column in INPUT.");
+
+  const dataRowIndex = (source === "AMAZON") ? firstDataRowAmazon_(input.values) : 2;
+  const dataRow = input.values[dataRowIndex] || [];
+  const wt = String(dataRow[workTypeCol] || "").trim();
+  if (wt !== "Movie" && wt !== "Episode") throw new Error("WorkType must be Movie or Episode in the first data row.");
+  return wt;
+}
+
+function firstDataRowAmazon_(values) {
+  for (let i = 2; i < values.length; i++) {
+    if (!isRowBlank_(values[i])) return i;
+  }
+  return 3;
+}
+
+function isRowBlank_(row) {
+  for (let i = 0; i < row.length; i++) {
+    if (String(row[i] || "").trim() !== "") return false;
+  }
+  return true;
+}
+
+/* -----------------------------
+   Templates
+--------------------------------*/
+function getTemplate_(ss, target, workType) {
+  const name =
+    target === "AMAZON"
+      ? (workType === "Movie" ? "TEMPLATE_AMZ_MOVIE" : "TEMPLATE_AMZ_EPISODE")
+      : (workType === "Movie" ? "TEMPLATE_YT_MOVIE" : "TEMPLATE_YT_EPISODE");
+
+  const sh = ss.getSheetByName(name);
+  if (!sh) throw new Error("Missing template sheet: " + name);
+
+  const v = readBlock_(sh).values;
+  if (v.length < 2) throw new Error("Template sheet " + name + " must include at least 2 header rows.");
+
+  const groupRow = v[0];
+  const fieldRow = v[1];
+  const blankRow = (target === "AMAZON") ? (v[2] || new Array(fieldRow.length).fill("")) : null;
+
+  const fieldIndex = {};
+  for (let c = 0; c < fieldRow.length; c++) {
+    const key = String(fieldRow[c] || "").trim();
+    if (key && fieldIndex[key] === undefined) fieldIndex[key] = c;
+  }
+
+  return {
+    target,
+    workType,
+    width: fieldRow.length,
+    groupRow,
+    fieldRow,
+    blankRow,
+    fieldIndex
+  };
+}
+
+/* -----------------------------
+   Conversion core
+--------------------------------*/
+function buildConvertedOutput_(input, source, target, tmpl, workType) {
+  const inValues = input.values;
+  const inFieldRow = inValues[1] || [];
+
+  const inFieldIndex = {};
+  for (let c = 0; c < inFieldRow.length; c++) {
+    const key = String(inFieldRow[c] || "").trim();
+    if (key && inFieldIndex[key] === undefined) inFieldIndex[key] = c;
+  }
+
+  const inDataStart = (source === "AMAZON") ? firstDataRowAmazon_(inValues) : 2;
+
+  const out = [];
+  out.push(padToWidth_(tmpl.groupRow, tmpl.width));
+  out.push(padToWidth_(tmpl.fieldRow, tmpl.width));
+  if (tmpl.target === "AMAZON") out.push(padToWidth_(tmpl.blankRow, tmpl.width));
+
+  for (let r = inDataStart; r < inValues.length; r++) {
+    const row = inValues[r];
+    if (isRowBlank_(row)) continue;
+
+    const outRow = new Array(tmpl.width).fill("");
+
+    // Copy any same-named fields that exist in both
+    Object.keys(tmpl.fieldIndex).forEach(function(fieldName) {
+      if (inFieldIndex[fieldName] === undefined) return;
+      outRow[tmpl.fieldIndex[fieldName]] = row[inFieldIndex[fieldName]];
+    });
+
+    // Normalize Start / End based on direction
+    const hasStartIn = (inFieldIndex["Start"] !== undefined);
+    const hasEndIn = (inFieldIndex["End"] !== undefined);
+    const hasStartOut = (tmpl.fieldIndex["Start"] !== undefined);
+    const hasEndOut = (tmpl.fieldIndex["End"] !== undefined);
+
+    if (hasStartIn && hasStartOut) {
+      const v = row[inFieldIndex["Start"]];
+      outRow[tmpl.fieldIndex["Start"]] =
+        (source === "YOUTUBE" && target === "AMAZON") ? isoToAmazonDate_(v)
+        : (source === "AMAZON" && target === "YOUTUBE") ? amazonDateToIsoStart_(v)
+        : v;
+    }
+
+    if (hasEndIn && hasEndOut) {
+      const v = row[inFieldIndex["End"]];
+      outRow[tmpl.fieldIndex["End"]] =
+        (source === "YOUTUBE" && target === "AMAZON") ? isoToAmazonDate_(v)
+        : (source === "AMAZON" && target === "YOUTUBE") ? amazonDateToIsoEnd_(v)
+        : v;
+    }
+
+    // Force LicenseRightsDescription per target format
+    if (tmpl.fieldIndex["LicenseRightsDescription"] !== undefined) {
+      outRow[tmpl.fieldIndex["LicenseRightsDescription"]] = (target === "YOUTUBE") ? "Library" : "SWP";
+    }
+
+    // Force DisplayName per target format
+    if (tmpl.fieldIndex["DisplayName"] !== undefined) {
+      outRow[tmpl.fieldIndex["DisplayName"]] = (target === "YOUTUBE") ? "pureflix.com" : "pureflix";
+    }
+
+    // TitleInternalAlias -> TitleInternalAlias + TitleDisplayUnlimited when converting to Amazon
+    if (target === "AMAZON") {
+      const tia = getInTrim_(row, inFieldIndex, ["TitleInternalAlias"]);
+      if (tia) {
+        if (tmpl.fieldIndex["TitleInternalAlias"] !== undefined) outRow[tmpl.fieldIndex["TitleInternalAlias"]] = tia;
+        if (tmpl.fieldIndex["TitleDisplayUnlimited"] !== undefined) outRow[tmpl.fieldIndex["TitleDisplayUnlimited"]] = tia;
+      }
+    }
+
+    // Defaults when converting from YouTube to Amazon (only if missing or blank in YouTube input)
+    if (source === "YOUTUBE" && target === "AMAZON") {
+      const defaults = {
+        "GroupIdentity": "pureflixus1",
+        "LicenseType": "SVOD",
+        "FormatProfile": "HD",
+        "PriceType": "Category",
+        "PriceValue": "Sub",
+        "Download": "FALSE",
+        "CaptionIncluded": "Yes"
+      };
+
+      Object.keys(defaults).forEach(function(fieldName) {
+        if (tmpl.fieldIndex[fieldName] === undefined) return;
+
+        const hasInCol = (inFieldIndex[fieldName] !== undefined);
+        const inVal = hasInCol ? row[inFieldIndex[fieldName]] : "";
+        const isBlank = String(inVal === null || inVal === undefined ? "" : inVal).trim() === "";
+
+        if (!hasInCol || isBlank) {
+          outRow[tmpl.fieldIndex[fieldName]] = defaults[fieldName];
+        }
+      });
+    }
+
+    // YouTube rule: End cannot be greater than 2036-01-02
+    if (target === "YOUTUBE" && tmpl.fieldIndex["End"] !== undefined) {
+      outRow[tmpl.fieldIndex["End"]] = clampYoutubeEnd_(outRow[tmpl.fieldIndex["End"]]);
+    }
+
+    // Movie rule: YouTube -> Amazon ALID -> AltID + ContentID + ALID
+    if (source === "YOUTUBE" && target === "AMAZON" && workType === "Movie") {
+      const alidVal = getInTrim_(row, inFieldIndex, ["ALID"]);
+      if (alidVal) {
+        if (tmpl.fieldIndex["AltID"] !== undefined) outRow[tmpl.fieldIndex["AltID"]] = alidVal;
+        if (tmpl.fieldIndex["ContentID"] !== undefined) outRow[tmpl.fieldIndex["ContentID"]] = alidVal;
+        if (tmpl.fieldIndex["ALID"] !== undefined) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
+      }
+    }
+
+    // Episode rule: YouTube -> Amazon mappings
+    if (source === "YOUTUBE" && target === "AMAZON" && workType === "Episode") {
+      // Avail ALID -> Avail ALID, EpisodeAltID, EpisodeContentID
+      const alidVal = getInTrim_(row, inFieldIndex, ["ALID"]);
+      if (alidVal) {
+        if (tmpl.fieldIndex["ALID"] !== undefined) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
+        if (tmpl.fieldIndex["EpisodeAltID"] !== undefined) outRow[tmpl.fieldIndex["EpisodeAltID"]] = alidVal;
+        if (tmpl.fieldIndex["EpisodeContentID"] !== undefined) outRow[tmpl.fieldIndex["EpisodeContentID"]] = alidVal;
+      }
+
+      // SeriesID -> SeriesID + SeriesAltID + SeriesContentID
+      const seriesVal = getInTrim_(row, inFieldIndex, ["SeriesID"]);
+      if (seriesVal) {
+        if (tmpl.fieldIndex["SeriesID"] !== undefined) outRow[tmpl.fieldIndex["SeriesID"]] = seriesVal;
+        if (tmpl.fieldIndex["SeriesAltID"] !== undefined) outRow[tmpl.fieldIndex["SeriesAltID"]] = seriesVal;
+        if (tmpl.fieldIndex["SeriesContentID"] !== undefined) outRow[tmpl.fieldIndex["SeriesContentID"]] = seriesVal;
+      }
+
+      // SeasonID (if present) -> SeasonID + SeasonAltID + SeasonContentID
+      const seasonVal = getInTrim_(row, inFieldIndex, ["SeasonID"]);
+      if (seasonVal) {
+        if (tmpl.fieldIndex["SeasonID"] !== undefined) outRow[tmpl.fieldIndex["SeasonID"]] = seasonVal;
+        if (tmpl.fieldIndex["SeasonAltID"] !== undefined) outRow[tmpl.fieldIndex["SeasonAltID"]] = seasonVal;
+        if (tmpl.fieldIndex["SeasonContentID"] !== undefined) outRow[tmpl.fieldIndex["SeasonContentID"]] = seasonVal;
+      }
+    }
+
+    // Episode rule: Amazon -> YouTube mappings (fallbacks)
+    if (source === "AMAZON" && target === "YOUTUBE" && workType === "Episode") {
+
+      // If YT SeriesID is blank, pull from Amazon SeriesContentID / SeriesAltID / SeriesID
+      if (tmpl.fieldIndex["SeriesID"] !== undefined) {
+        const cur = String(outRow[tmpl.fieldIndex["SeriesID"]] || "").trim();
+        if (!cur) {
+          const seriesVal = getInTrim_(row, inFieldIndex, ["SeriesID", "SeriesContentID", "SeriesAltID"]);
+          if (seriesVal) outRow[tmpl.fieldIndex["SeriesID"]] = seriesVal;
+        }
+      }
+
+      // Optional: if YT ALID is blank, pull from Amazon EpisodeContentID / EpisodeAltID / ALID
+      if (tmpl.fieldIndex["ALID"] !== undefined) {
+        const curA = String(outRow[tmpl.fieldIndex["ALID"]] || "").trim();
+        if (!curA) {
+          const alidVal = getInTrim_(row, inFieldIndex, ["ALID", "EpisodeContentID", "EpisodeAltID"]);
+          if (alidVal) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
+        }
+      }
+    }
+
+    out.push(outRow);
+  }
+
+  return out;
+}
+
+function getInTrim_(row, inFieldIndex, names) {
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    if (inFieldIndex[name] === undefined) continue;
+    const v = row[inFieldIndex[name]];
+    const s = String(v === null || v === undefined ? "" : v).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function padToWidth_(row, width) {
+  const out = new Array(width).fill("");
+  for (let i = 0; i < Math.min(width, row.length); i++) out[i] = row[i];
+  return out;
+}
+
+/* -----------------------------
+   Date helpers
+--------------------------------*/
+const NY_TZ_ = "America/New_York";
+const YT_END_MAX_YMD_ = "2036-01-02";
+
+function clampYoutubeEnd_(isoValue) {
+  if (isoValue === "" || isoValue === null || isoValue === undefined) return isoValue;
+
+  const s = String(isoValue).trim();
+  if (s.length < 10) return isoValue;
+
+  const ymd = s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ymd) && ymd > YT_END_MAX_YMD_) {
+    return amazonDateToIsoEnd_(YT_END_MAX_YMD_);
+  }
+  return isoValue;
+}
+
+function isoToAmazonDate_(value) {
+  if (value === "" || value === null) return "";
+  const d = coerceToDate_(value);
+  if (!d) return "";
+  return Utilities.formatDate(d, NY_TZ_, "yyyy-MM-dd");
+}
+
+function amazonDateToIsoStart_(value) {
+  const dateStr = coerceToYmd_(value);
+  if (!dateStr) return "";
+  const d = Utilities.parseDate(dateStr + " 00:00:00", NY_TZ_, "yyyy-MM-dd HH:mm:ss");
+  return toIsoNoMillis_(d);
+}
+
+function amazonDateToIsoEnd_(value) {
+  const dateStr = coerceToYmd_(value);
+  if (!dateStr) return "";
+  const d = Utilities.parseDate(dateStr + " 23:59:59", NY_TZ_, "yyyy-MM-dd HH:mm:ss");
+  return toIsoNoMillis_(d);
+}
+
+function toIsoNoMillis_(d) {
+  return d.toISOString().replace(".000Z", "Z");
+}
+
+function coerceToDate_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) return value;
+
+  const s = String(value || "").trim();
+  if (!s) return null;
+
+  if (s.indexOf("T") > 0 && s.indexOf("Z") > 0) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(s + "T00:00:00Z");
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  const d2 = new Date(s);
+  if (!isNaN(d2.getTime())) return d2;
+  return null;
+}
+
+function coerceToYmd_(value) {
+  if (value === "" || value === null) return "";
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, NY_TZ_, "yyyy-MM-dd");
+  }
+  const s = String(value || "").trim();
+  if (!s) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return Utilities.formatDate(d, NY_TZ_, "yyyy-MM-dd");
+  return "";
+}
+
+/* -----------------------------
+   Output formatting
+--------------------------------*/
+function applyFormats_(sh, target, outFieldIndex) {
+  if (target === "YOUTUBE") {
+    ["ALID", "Start", "End"].forEach(function(name) {
+      if (outFieldIndex[name] === undefined) return;
+      const col = outFieldIndex[name] + 1;
+      sh.getRange(3, col, sh.getLastRow() - 2, 1).setNumberFormat("@");
+    });
+  }
+
+  if (target === "AMAZON") {
+    ["Start", "End"].forEach(function(name) {
+      if (outFieldIndex[name] === undefined) return;
+      const col = outFieldIndex[name] + 1;
+      sh.getRange(4, col, Math.max(1, sh.getLastRow() - 3), 1).setNumberFormat("yyyy-mm-dd");
+    });
+  }
+}

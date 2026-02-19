@@ -14,6 +14,75 @@ function convertToYouTube() {
   convert_("YOUTUBE");
 }
 
+/* -----------------------------
+   LicenseRightsDescription mapping (from sheet tab)
+   Sheet name: MAP_LicenseRightsDescription
+   Columns:
+     A: Amazon LicenseRightsDescription
+     B: You Tube Specific LicenseRightsDescription
+--------------------------------*/
+const LRD_MAP_SHEET_ = "MAP_LicenseRightsDescription";
+const LRD_AMZ_HEADER_ = "Amazon LicenseRightsDescription";
+const LRD_YT_HEADER_ = "You Tube Specific LicenseRightsDescription";
+
+function getLicenseRightsMaps_(ss) {
+  const sh = ensureLicenseRightsMapSheet_(ss);
+  const values = sh.getDataRange().getValues();
+  if (!values || values.length < 2) return { amzToYt: {}, ytToAmz: {} };
+
+  const header = values[0].map(v => String(v || "").trim());
+  const amzCol = header.indexOf(LRD_AMZ_HEADER_);
+  const ytCol = header.indexOf(LRD_YT_HEADER_);
+  if (amzCol < 0 || ytCol < 0) {
+    throw new Error(
+      "Mapping sheet must have headers: " +
+        LRD_AMZ_HEADER_ +
+        " and " +
+        LRD_YT_HEADER_
+    );
+  }
+
+  const amzToYt = {};
+  const ytToAmz = {};
+
+  for (let r = 1; r < values.length; r++) {
+    const amz = String(values[r][amzCol] || "").trim();
+    const yt = String(values[r][ytCol] || "").trim();
+    if (!amz || !yt) continue;
+
+    if (amzToYt[amz] === undefined) amzToYt[amz] = yt;
+    if (ytToAmz[yt] === undefined) ytToAmz[yt] = amz;
+  }
+
+  return { amzToYt, ytToAmz };
+}
+
+function ensureLicenseRightsMapSheet_(ss) {
+  let sh = ss.getSheetByName(LRD_MAP_SHEET_);
+  if (sh) return sh;
+
+  sh = ss.insertSheet(LRD_MAP_SHEET_);
+
+  const seed = [
+    [LRD_AMZ_HEADER_, LRD_YT_HEADER_],
+    ["Library", "Library"],
+    ["SWP", "Priority Library"],
+    ["SDP", "Mega Library"]
+  ];
+
+  sh.getRange(1, 1, seed.length, seed[0].length).setValues(seed);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, 2);
+
+  return sh;
+}
+
+function mapLicenseRights_(inVal, mapObj, defaultVal) {
+  const k = String(inVal === null || inVal === undefined ? "" : inVal).trim();
+  if (!k) return defaultVal;
+  return (mapObj[k] !== undefined) ? mapObj[k] : defaultVal;
+}
+
 function convert_(target) {
   const ss = SpreadsheetApp.getActive();
   const inputSh = ss.getSheetByName("INPUT");
@@ -27,7 +96,8 @@ function convert_(target) {
   const workType = detectWorkType_(input, source);
 
   const tmpl = getTemplate_(ss, target, workType);
-  const out = buildConvertedOutput_(input, source, target, tmpl, workType);
+  const lrdMaps = getLicenseRightsMaps_(ss);
+  const out = buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps);
 
   outputSh.clearContents();
   outputSh.getRange(1, 1, out.length, out[0].length).setValues(out);
@@ -125,7 +195,7 @@ function getTemplate_(ss, target, workType) {
 /* -----------------------------
    Conversion core
 --------------------------------*/
-function buildConvertedOutput_(input, source, target, tmpl, workType) {
+function buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps) {
   const inValues = input.values;
   const inFieldRow = inValues[1] || [];
 
@@ -176,9 +246,22 @@ function buildConvertedOutput_(input, source, target, tmpl, workType) {
         : v;
     }
 
-    // Force LicenseRightsDescription per target format
+    // LicenseRightsDescription mapping (sheet-driven)
     if (tmpl.fieldIndex["LicenseRightsDescription"] !== undefined) {
-      outRow[tmpl.fieldIndex["LicenseRightsDescription"]] = (target === "YOUTUBE") ? "Library" : "SWP";
+      const inLRD = getInTrim_(row, inFieldIndex, ["LicenseRightsDescription"]);
+
+      let outLRD = inLRD;
+
+      if (source === "AMAZON" && target === "YOUTUBE") {
+        outLRD = mapLicenseRights_(inLRD, (lrdMaps && lrdMaps.amzToYt) ? lrdMaps.amzToYt : {}, "Library");
+      } else if (source === "YOUTUBE" && target === "AMAZON") {
+        outLRD = mapLicenseRights_(inLRD, (lrdMaps && lrdMaps.ytToAmz) ? lrdMaps.ytToAmz : {}, "SWP");
+      } else {
+        // Same-system conversion or unknown direction
+        outLRD = String(inLRD || "").trim() ? inLRD : ((target === "YOUTUBE") ? "Library" : "SWP");
+      }
+
+      outRow[tmpl.fieldIndex["LicenseRightsDescription"]] = outLRD;
     }
 
     // Force DisplayName per target format

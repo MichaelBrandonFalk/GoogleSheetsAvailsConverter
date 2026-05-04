@@ -14,75 +14,6 @@ function convertToYouTube() {
   convert_("YOUTUBE");
 }
 
-/* -----------------------------
-   LicenseRightsDescription mapping (from sheet tab)
-   Sheet name: MAP_LicenseRightsDescription
-   Columns:
-     A: Amazon LicenseRightsDescription
-     B: You Tube Specific LicenseRightsDescription
---------------------------------*/
-const LRD_MAP_SHEET_ = "MAP_LicenseRightsDescription";
-const LRD_AMZ_HEADER_ = "Amazon LicenseRightsDescription";
-const LRD_YT_HEADER_ = "You Tube Specific LicenseRightsDescription";
-
-function getLicenseRightsMaps_(ss) {
-  const sh = ensureLicenseRightsMapSheet_(ss);
-  const values = sh.getDataRange().getValues();
-  if (!values || values.length < 2) return { amzToYt: {}, ytToAmz: {} };
-
-  const header = values[0].map(v => String(v || "").trim());
-  const amzCol = header.indexOf(LRD_AMZ_HEADER_);
-  const ytCol = header.indexOf(LRD_YT_HEADER_);
-  if (amzCol < 0 || ytCol < 0) {
-    throw new Error(
-      "Mapping sheet must have headers: " +
-        LRD_AMZ_HEADER_ +
-        " and " +
-        LRD_YT_HEADER_
-    );
-  }
-
-  const amzToYt = {};
-  const ytToAmz = {};
-
-  for (let r = 1; r < values.length; r++) {
-    const amz = String(values[r][amzCol] || "").trim();
-    const yt = String(values[r][ytCol] || "").trim();
-    if (!amz || !yt) continue;
-
-    if (amzToYt[amz] === undefined) amzToYt[amz] = yt;
-    if (ytToAmz[yt] === undefined) ytToAmz[yt] = amz;
-  }
-
-  return { amzToYt, ytToAmz };
-}
-
-function ensureLicenseRightsMapSheet_(ss) {
-  let sh = ss.getSheetByName(LRD_MAP_SHEET_);
-  if (sh) return sh;
-
-  sh = ss.insertSheet(LRD_MAP_SHEET_);
-
-  const seed = [
-    [LRD_AMZ_HEADER_, LRD_YT_HEADER_],
-    ["Library", "Library"],
-    ["SWP", "Priority Library"],
-    ["SDP", "Mega Library"]
-  ];
-
-  sh.getRange(1, 1, seed.length, seed[0].length).setValues(seed);
-  sh.setFrozenRows(1);
-  sh.autoResizeColumns(1, 2);
-
-  return sh;
-}
-
-function mapLicenseRights_(inVal, mapObj, defaultVal) {
-  const k = String(inVal === null || inVal === undefined ? "" : inVal).trim();
-  if (!k) return defaultVal;
-  return (mapObj[k] !== undefined) ? mapObj[k] : defaultVal;
-}
-
 function convert_(target) {
   const ss = SpreadsheetApp.getActive();
   const inputSh = ss.getSheetByName("INPUT");
@@ -96,8 +27,7 @@ function convert_(target) {
   const workType = detectWorkType_(input, source);
 
   const tmpl = getTemplate_(ss, target, workType);
-  const lrdMaps = getLicenseRightsMaps_(ss);
-  const out = buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps);
+  const out = buildConvertedOutput_(input, source, target, tmpl, workType);
 
   outputSh.clearContents();
   outputSh.getRange(1, 1, out.length, out[0].length).setValues(out);
@@ -195,7 +125,7 @@ function getTemplate_(ss, target, workType) {
 /* -----------------------------
    Conversion core
 --------------------------------*/
-function buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps) {
+function buildConvertedOutput_(input, source, target, tmpl, workType) {
   const inValues = input.values;
   const inFieldRow = inValues[1] || [];
 
@@ -218,13 +148,13 @@ function buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps) {
 
     const outRow = new Array(tmpl.width).fill("");
 
-    // Copy any same-named fields that exist in both
+    // 1. Standard Mapping: Copy same-named fields
     Object.keys(tmpl.fieldIndex).forEach(function(fieldName) {
       if (inFieldIndex[fieldName] === undefined) return;
       outRow[tmpl.fieldIndex[fieldName]] = row[inFieldIndex[fieldName]];
     });
 
-    // Normalize Start / End based on direction
+    // 2. Date Logic
     const hasStartIn = (inFieldIndex["Start"] !== undefined);
     const hasEndIn = (inFieldIndex["End"] !== undefined);
     const hasStartOut = (tmpl.fieldIndex["Start"] !== undefined);
@@ -246,40 +176,50 @@ function buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps) {
         : v;
     }
 
-    // LicenseRightsDescription mapping (sheet-driven)
+    // 3. License/Display Overrides
     if (tmpl.fieldIndex["LicenseRightsDescription"] !== undefined) {
-      const inLRD = getInTrim_(row, inFieldIndex, ["LicenseRightsDescription"]);
-
-      let outLRD = inLRD;
-
-      if (source === "AMAZON" && target === "YOUTUBE") {
-        outLRD = mapLicenseRights_(inLRD, (lrdMaps && lrdMaps.amzToYt) ? lrdMaps.amzToYt : {}, "Library");
-      } else if (source === "YOUTUBE" && target === "AMAZON") {
-        outLRD = mapLicenseRights_(inLRD, (lrdMaps && lrdMaps.ytToAmz) ? lrdMaps.ytToAmz : {}, "SWP");
-      } else {
-        // Same-system conversion or unknown direction
-        outLRD = String(inLRD || "").trim() ? inLRD : ((target === "YOUTUBE") ? "Library" : "SWP");
-      }
-
-      outRow[tmpl.fieldIndex["LicenseRightsDescription"]] = outLRD;
+      outRow[tmpl.fieldIndex["LicenseRightsDescription"]] = (target === "YOUTUBE") ? "Library" : "SWP";
     }
-
-    // Force DisplayName per target format
     if (tmpl.fieldIndex["DisplayName"] !== undefined) {
       outRow[tmpl.fieldIndex["DisplayName"]] = (target === "YOUTUBE") ? "pureflix.com" : "pureflix";
     }
 
-    // TitleInternalAlias -> TitleInternalAlias + TitleDisplayUnlimited when converting to Amazon
+    // 4. Series/Retailer ID Mapping Logic
+    if (workType === "Episode") {
+      // Cross-direction Series ID mapping
+      if (source === "AMAZON" && target === "YOUTUBE") {
+        const val = getInTrim_(row, inFieldIndex, ["SeriesAltID"]);
+        if (val && tmpl.fieldIndex["SeriesID"] !== undefined) outRow[tmpl.fieldIndex["SeriesID"]] = val;
+      } else if (source === "YOUTUBE" && target === "AMAZON") {
+        const val = getInTrim_(row, inFieldIndex, ["SeriesID"]);
+        if (val && tmpl.fieldIndex["SeriesAltID"] !== undefined) outRow[tmpl.fieldIndex["SeriesAltID"]] = val;
+      }
+
+      // Simple mapping for Retailer IDs (Keep values 1:1 if they exist)
+      const rEp = getInTrim_(row, inFieldIndex, ["RetailerEpisodeID1"]);
+      const rSer = getInTrim_(row, inFieldIndex, ["RetailerSeriesID"]);
+      const rSea = getInTrim_(row, inFieldIndex, ["RetailerSeasonID"]);
+
+      if (rEp && tmpl.fieldIndex["RetailerEpisodeID1"] !== undefined) outRow[tmpl.fieldIndex["RetailerEpisodeID1"]] = rEp;
+      if (rSer && tmpl.fieldIndex["RetailerSeriesID"] !== undefined) outRow[tmpl.fieldIndex["RetailerSeriesID"]] = rSer;
+      if (rSea && tmpl.fieldIndex["RetailerSeasonID"] !== undefined) outRow[tmpl.fieldIndex["RetailerSeasonID"]] = rSea;
+
+    } else if (workType === "Movie") {
+      // RetailerID1 to RetailerID1 simple mapping
+      const rMov = getInTrim_(row, inFieldIndex, ["RetailerID1"]);
+      if (rMov && tmpl.fieldIndex["RetailerID1"] !== undefined) outRow[tmpl.fieldIndex["RetailerID1"]] = rMov;
+    }
+
+    // 5. Amazon Target Post-processing
     if (target === "AMAZON") {
-      const tia = getInTrim_(row, inFieldIndex, ["TitleInternalAlias"]);
+      // Internal Alias Sync
+      const tia = getInTrim_(row, inFieldIndex, ["TitleInternalAlias", "EpisodeTitleInternalAlias", "SeriesTitleInternalAlias"]);
       if (tia) {
         if (tmpl.fieldIndex["TitleInternalAlias"] !== undefined) outRow[tmpl.fieldIndex["TitleInternalAlias"]] = tia;
         if (tmpl.fieldIndex["TitleDisplayUnlimited"] !== undefined) outRow[tmpl.fieldIndex["TitleDisplayUnlimited"]] = tia;
       }
-    }
-
-    // Defaults when converting from YouTube to Amazon (only if missing or blank in YouTube input)
-    if (source === "YOUTUBE" && target === "AMAZON") {
+      
+      // Amazon Defaults
       const defaults = {
         "GroupIdentity": "pureflixus1",
         "LicenseType": "SVOD",
@@ -289,82 +229,16 @@ function buildConvertedOutput_(input, source, target, tmpl, workType, lrdMaps) {
         "Download": "FALSE",
         "CaptionIncluded": "Yes"
       };
-
       Object.keys(defaults).forEach(function(fieldName) {
         if (tmpl.fieldIndex[fieldName] === undefined) return;
-
-        const hasInCol = (inFieldIndex[fieldName] !== undefined);
-        const inVal = hasInCol ? row[inFieldIndex[fieldName]] : "";
-        const isBlank = String(inVal === null || inVal === undefined ? "" : inVal).trim() === "";
-
-        if (!hasInCol || isBlank) {
-          outRow[tmpl.fieldIndex[fieldName]] = defaults[fieldName];
-        }
+        const val = outRow[tmpl.fieldIndex[fieldName]];
+        if (!val || String(val).trim() === "") outRow[tmpl.fieldIndex[fieldName]] = defaults[fieldName];
       });
     }
 
-    // YouTube rule: End cannot be greater than 2036-01-02
+    // 6. YouTube Target Post-processing
     if (target === "YOUTUBE" && tmpl.fieldIndex["End"] !== undefined) {
       outRow[tmpl.fieldIndex["End"]] = clampYoutubeEnd_(outRow[tmpl.fieldIndex["End"]]);
-    }
-
-    // Movie rule: YouTube -> Amazon ALID -> AltID + ContentID + ALID
-    if (source === "YOUTUBE" && target === "AMAZON" && workType === "Movie") {
-      const alidVal = getInTrim_(row, inFieldIndex, ["ALID"]);
-      if (alidVal) {
-        if (tmpl.fieldIndex["AltID"] !== undefined) outRow[tmpl.fieldIndex["AltID"]] = alidVal;
-        if (tmpl.fieldIndex["ContentID"] !== undefined) outRow[tmpl.fieldIndex["ContentID"]] = alidVal;
-        if (tmpl.fieldIndex["ALID"] !== undefined) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
-      }
-    }
-
-    // Episode rule: YouTube -> Amazon mappings
-    if (source === "YOUTUBE" && target === "AMAZON" && workType === "Episode") {
-      // Avail ALID -> Avail ALID, EpisodeAltID, EpisodeContentID
-      const alidVal = getInTrim_(row, inFieldIndex, ["ALID"]);
-      if (alidVal) {
-        if (tmpl.fieldIndex["ALID"] !== undefined) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
-        if (tmpl.fieldIndex["EpisodeAltID"] !== undefined) outRow[tmpl.fieldIndex["EpisodeAltID"]] = alidVal;
-        if (tmpl.fieldIndex["EpisodeContentID"] !== undefined) outRow[tmpl.fieldIndex["EpisodeContentID"]] = alidVal;
-      }
-
-      // SeriesID -> SeriesID + SeriesAltID + SeriesContentID
-      const seriesVal = getInTrim_(row, inFieldIndex, ["SeriesID"]);
-      if (seriesVal) {
-        if (tmpl.fieldIndex["SeriesID"] !== undefined) outRow[tmpl.fieldIndex["SeriesID"]] = seriesVal;
-        if (tmpl.fieldIndex["SeriesAltID"] !== undefined) outRow[tmpl.fieldIndex["SeriesAltID"]] = seriesVal;
-        if (tmpl.fieldIndex["SeriesContentID"] !== undefined) outRow[tmpl.fieldIndex["SeriesContentID"]] = seriesVal;
-      }
-
-      // SeasonID (if present) -> SeasonID + SeasonAltID + SeasonContentID
-      const seasonVal = getInTrim_(row, inFieldIndex, ["SeasonID"]);
-      if (seasonVal) {
-        if (tmpl.fieldIndex["SeasonID"] !== undefined) outRow[tmpl.fieldIndex["SeasonID"]] = seasonVal;
-        if (tmpl.fieldIndex["SeasonAltID"] !== undefined) outRow[tmpl.fieldIndex["SeasonAltID"]] = seasonVal;
-        if (tmpl.fieldIndex["SeasonContentID"] !== undefined) outRow[tmpl.fieldIndex["SeasonContentID"]] = seasonVal;
-      }
-    }
-
-    // Episode rule: Amazon -> YouTube mappings (fallbacks)
-    if (source === "AMAZON" && target === "YOUTUBE" && workType === "Episode") {
-
-      // If YT SeriesID is blank, pull from Amazon SeriesContentID / SeriesAltID / SeriesID
-      if (tmpl.fieldIndex["SeriesID"] !== undefined) {
-        const cur = String(outRow[tmpl.fieldIndex["SeriesID"]] || "").trim();
-        if (!cur) {
-          const seriesVal = getInTrim_(row, inFieldIndex, ["SeriesID", "SeriesContentID", "SeriesAltID"]);
-          if (seriesVal) outRow[tmpl.fieldIndex["SeriesID"]] = seriesVal;
-        }
-      }
-
-      // Optional: if YT ALID is blank, pull from Amazon EpisodeContentID / EpisodeAltID / ALID
-      if (tmpl.fieldIndex["ALID"] !== undefined) {
-        const curA = String(outRow[tmpl.fieldIndex["ALID"]] || "").trim();
-        if (!curA) {
-          const alidVal = getInTrim_(row, inFieldIndex, ["ALID", "EpisodeContentID", "EpisodeAltID"]);
-          if (alidVal) outRow[tmpl.fieldIndex["ALID"]] = alidVal;
-        }
-      }
     }
 
     out.push(outRow);
@@ -397,11 +271,9 @@ const NY_TZ_ = "America/New_York";
 const YT_END_MAX_YMD_ = "2036-01-02";
 
 function clampYoutubeEnd_(isoValue) {
-  if (isoValue === "" || isoValue === null || isoValue === undefined) return isoValue;
-
+  if (!isoValue) return isoValue;
   const s = String(isoValue).trim();
   if (s.length < 10) return isoValue;
-
   const ymd = s.slice(0, 10);
   if (/^\d{4}-\d{2}-\d{2}$/.test(ymd) && ymd > YT_END_MAX_YMD_) {
     return amazonDateToIsoEnd_(YT_END_MAX_YMD_);
@@ -410,7 +282,7 @@ function clampYoutubeEnd_(isoValue) {
 }
 
 function isoToAmazonDate_(value) {
-  if (value === "" || value === null) return "";
+  if (!value) return "";
   const d = coerceToDate_(value);
   if (!d) return "";
   return Utilities.formatDate(d, NY_TZ_, "yyyy-MM-dd");
@@ -435,57 +307,48 @@ function toIsoNoMillis_(d) {
 }
 
 function coerceToDate_(value) {
-  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) return value;
-
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
   const s = String(value || "").trim();
   if (!s) return null;
-
-  if (s.indexOf("T") > 0 && s.indexOf("Z") > 0) {
+  if (s.indexOf("T") > 0) {
     const d = new Date(s);
     if (!isNaN(d.getTime())) return d;
   }
-
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const d = new Date(s + "T00:00:00Z");
     if (!isNaN(d.getTime())) return d;
   }
-
   const d2 = new Date(s);
-  if (!isNaN(d2.getTime())) return d2;
-  return null;
+  return isNaN(d2.getTime()) ? null : d2;
 }
 
 function coerceToYmd_(value) {
-  if (value === "" || value === null) return "";
-  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
-    return Utilities.formatDate(value, NY_TZ_, "yyyy-MM-dd");
-  }
+  if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, NY_TZ_, "yyyy-MM-dd");
   const s = String(value || "").trim();
   if (!s) return "";
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-
   const d = new Date(s);
-  if (!isNaN(d.getTime())) return Utilities.formatDate(d, NY_TZ_, "yyyy-MM-dd");
-  return "";
+  return isNaN(d.getTime()) ? "" : Utilities.formatDate(d, NY_TZ_, "yyyy-MM-dd");
 }
 
 /* -----------------------------
    Output formatting
 --------------------------------*/
 function applyFormats_(sh, target, outFieldIndex) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < 3) return;
+
   if (target === "YOUTUBE") {
-    ["ALID", "Start", "End"].forEach(function(name) {
+    ["ALID", "Start", "End", "SeriesID", "SeasonID", "RetailerEpisodeID1", "RetailerSeriesID", "RetailerSeasonID", "RetailerID1"].forEach(function(name) {
       if (outFieldIndex[name] === undefined) return;
-      const col = outFieldIndex[name] + 1;
-      sh.getRange(3, col, sh.getLastRow() - 2, 1).setNumberFormat("@");
+      sh.getRange(3, outFieldIndex[name] + 1, lastRow - 2, 1).setNumberFormat("@");
     });
   }
 
   if (target === "AMAZON") {
     ["Start", "End"].forEach(function(name) {
       if (outFieldIndex[name] === undefined) return;
-      const col = outFieldIndex[name] + 1;
-      sh.getRange(4, col, Math.max(1, sh.getLastRow() - 3), 1).setNumberFormat("yyyy-mm-dd");
+      sh.getRange(4, outFieldIndex[name] + 1, Math.max(1, lastRow - 3), 1).setNumberFormat("yyyy-mm-dd");
     });
   }
 }
